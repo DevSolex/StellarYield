@@ -44,6 +44,11 @@ const ENDPOINTS: EndpointExpectation[] = [
   { path: "/api/health/digest", okStatuses: [200, 404] },
   { path: "/api/health/keepers", okStatuses: [200] },
   { path: "/api/health/boot-summary", okStatuses: [200, 503] },
+  {
+    path: "/api/health/summary",
+    okStatuses: [200, 503],
+    requiredFields: ["status", "database", "indexer", "checkedAt"],
+  },
 ];
 
 describe("Production health endpoints — integration smoke", () => {

@@ -1286,5 +1286,139 @@ router.get("/boot-summary", async (_req: Request, res: Response) => {
   res.status(overallStatus === "failed" ? 503 : 200).json(body);
 });
 
-export default router;
+// ── Health Summary: indexer and database latency (#1375) ──────────────────────
 
+/**
+ * Latency tier classification based on the configured health timeout.
+ *
+ * - "fast":     < 20 % of HEALTH_TIMEOUT_MS
+ * - "moderate": 20 %–60 % of HEALTH_TIMEOUT_MS
+ * - "slow":     > 60 % of HEALTH_TIMEOUT_MS (but responded)
+ * - "timeout":  did not respond within HEALTH_TIMEOUT_MS
+ */
+export type LatencyTier = "fast" | "moderate" | "slow" | "timeout";
+
+function classifyLatency(latencyMs: number | undefined): LatencyTier {
+  if (latencyMs === undefined) return "timeout";
+  if (latencyMs < HEALTH_TIMEOUT_MS * 0.2) return "fast";
+  if (latencyMs < HEALTH_TIMEOUT_MS * 0.6) return "moderate";
+  return "slow";
+}
+
+export interface ComponentLatencySummary {
+  status: string;
+  latencyMs: number | undefined;
+  latencyTier: LatencyTier;
+  checkedAt: string;
+  errorCode: string | null;
+  retryable: boolean;
+  hint?: string;
+}
+
+export interface IndexerLatencySummary extends ComponentLatencySummary {
+  syncedLedger?: number;
+  lagLedgers?: number;
+}
+
+export interface HealthSummaryResponse {
+  /** Overall health status derived from the two checked components. */
+  status: "healthy" | "degraded" | "unavailable";
+  database: ComponentLatencySummary;
+  indexer: IndexerLatencySummary;
+  checkedAt: string;
+}
+
+/**
+ * GET /health/summary
+ *
+ * Returns a focused health summary for the two most latency-sensitive
+ * backend components: the Postgres database and the on-chain indexer.
+ * Each entry includes:
+ *   - status          — healthy / degraded / unavailable
+ *   - latencyMs       — round-trip time for the health probe
+ *   - latencyTier     — "fast" / "moderate" / "slow" / "timeout"
+ *   - checkedAt       — ISO timestamp of the probe
+ *   - errorCode       — stable machine-readable code or null
+ *   - retryable       — whether the failure is likely transient
+ *
+ * The indexer entry additionally exposes syncedLedger and lagLedgers
+ * so operators can assess how far behind the indexer has fallen without
+ * needing to call /health/dependencies.
+ *
+ * Returns 200 when both components are healthy or degraded, 503 when
+ * either is unavailable.
+ */
+router.get("/summary", async (_req: Request, res: Response) => {
+  const checkedAt = new Date().toISOString();
+
+  // Fetch database and horizon snapshots in parallel; use horizon latestLedger
+  // to compute indexer lag accurately.
+  const [dbSnap, horizonSnap] = await Promise.all([
+    checkDatabaseSnapshot(),
+    checkHorizonSnapshot(),
+  ]);
+
+  const indexerSnap = await checkIndexerSnapshot(horizonSnap.latestLedger);
+
+  const mapStatus = (
+    s: string,
+  ): "healthy" | "degraded" | "unavailable" => {
+    if (s === "healthy") return "healthy";
+    if (s === "unavailable" || s === "misconfigured") return "unavailable";
+    return "degraded";
+  };
+
+  const database: ComponentLatencySummary = {
+    status: mapStatus(dbSnap.status),
+    latencyMs: dbSnap.latencyMs,
+    latencyTier: classifyLatency(dbSnap.latencyMs),
+    checkedAt: dbSnap.checkedAt,
+    errorCode: dbSnap.errorCode,
+    retryable: dbSnap.retryable,
+    hint:
+      dbSnap.status === "unavailable"
+        ? "Database unreachable — check DATABASE_URL and Postgres availability"
+        : dbSnap.status === "degraded"
+          ? "Database responding slowly — check connection pool and query performance"
+          : undefined,
+  };
+
+  const indexer: IndexerLatencySummary = {
+    status: mapStatus(indexerSnap.status),
+    latencyMs: indexerSnap.latencyMs,
+    latencyTier: classifyLatency(indexerSnap.latencyMs),
+    checkedAt: indexerSnap.checkedAt,
+    errorCode: indexerSnap.errorCode,
+    retryable: indexerSnap.retryable,
+    syncedLedger: indexerSnap.syncedLedger,
+    lagLedgers: indexerSnap.lagLedgers,
+    hint:
+      indexerSnap.errorCode === "INDEXER_LAG_EXCESSIVE"
+        ? `Indexer severely stalled (${indexerSnap.lagLedgers} ledgers behind) — restart indexer service`
+        : indexerSnap.errorCode === "INDEXER_LAG_ELEVATED"
+          ? `Indexer lagging (${indexerSnap.lagLedgers} ledgers behind) — may indicate slow replay`
+          : indexerSnap.status === "unavailable"
+            ? "Indexer state unavailable — check database connectivity and indexer process"
+            : undefined,
+  };
+
+  const componentStatuses = [database.status, indexer.status];
+  const overallStatus: HealthSummaryResponse["status"] = componentStatuses.includes(
+    "unavailable",
+  )
+    ? "unavailable"
+    : componentStatuses.includes("degraded")
+      ? "degraded"
+      : "healthy";
+
+  const body: HealthSummaryResponse = {
+    status: overallStatus,
+    database,
+    indexer,
+    checkedAt,
+  };
+
+  res.status(overallStatus === "unavailable" ? 503 : 200).json(body);
+});
+
+export default router;
